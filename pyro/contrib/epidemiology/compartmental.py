@@ -17,10 +17,13 @@ import pyro.distributions.hmm
 import pyro.poutine as poutine
 from pyro.distributions.transforms import DiscreteCosineTransform
 from pyro.infer import MCMC, NUTS, SMCFilter, infer_discrete
-from pyro.infer.autoguide import init_to_value
+from pyro.infer.autoguide import init_to_generated, init_to_value
+from pyro.infer.mcmc import ArrowheadMassMatrix
 from pyro.infer.reparam import DiscreteCosineReparam
+from pyro.infer.smcfilter import SMCFailed
 from pyro.util import warn_if_nan
 
+from .distributions import set_approx_sample_thresh
 from .util import align_samples, cat2, clamp, quantize, quantize_enumerate
 
 logger = logging.getLogger(__name__)
@@ -41,7 +44,6 @@ class CompartmentalModel(ABC):
         # First implement a concrete derived class.
         class MyModel(CompartmentalModel):
             def __init__(self, ...): ...
-            def heuristic(self): ...
             def global_model(self): ...
             def initialize(self, params): ...
             def transition_fwd(self, params, state, t): ...
@@ -142,7 +144,8 @@ class CompartmentalModel(ABC):
     full_mass = False
 
     @torch.no_grad()
-    def heuristic(self, num_particles=1024):
+    @set_approx_sample_thresh(1000)
+    def heuristic(self, num_particles=1024, ess_threshold=0.5, retries=10):
         """
         Finds an initial feasible guess of all latent variables, consistent
         with observed data. This is needed because not all hypotheses are
@@ -154,17 +157,27 @@ class CompartmentalModel(ABC):
         performs poorly e.g. in high-dimensional models.
 
         :param int num_particles: Number of particles used for SMC.
+        :param float ess_threshold: Effective sample size threshold for SMC.
         :returns: A dictionary mapping sample site name to tensor value.
         :rtype: dict
         """
         # Run SMC.
         model = _SMCModel(self)
         guide = _SMCGuide(self)
-        smc = SMCFilter(model, guide, num_particles=num_particles,
-                        max_plate_nesting=self.max_plate_nesting)
-        smc.init()
-        for t in range(1, self.duration):
-            smc.step()
+        for attempt in range(1, 1 + retries):
+            smc = SMCFilter(model, guide, num_particles=num_particles,
+                            ess_threshold=ess_threshold,
+                            max_plate_nesting=self.max_plate_nesting)
+            try:
+                smc.init()
+                for t in range(1, self.duration):
+                    smc.step()
+                break
+            except SMCFailed as e:
+                if attempt == retries:
+                    raise
+                logger.info("{}. Retrying...".format(e))
+                continue
 
         # Select the most probable hypothesis.
         i = int(smc.state._log_weights.max(0).indices)
@@ -281,6 +294,8 @@ class CompartmentalModel(ABC):
             :class:`~pyro.infer.mcmc.nuts.NUTS` kernel.
         :param full_mass: (Default ``False``). Specification of mass matrix
             of the :class:`~pyro.infer.mcmc.nuts.NUTS` kernel.
+        :param bool arrowhead_mass: Whether to treat ``full_mass`` as the head
+            of an arrowhead matrix versus simply as a block. Defaults to False.
         :param int num_quant_bins: The number of quantization bins to use. Note
             that computational cost is exponential in `num_quant_bins`.
             Defaults to 4.
@@ -298,19 +313,27 @@ class CompartmentalModel(ABC):
             raise NotImplementedError("regional models do not support DiscreteCosineReparam")
 
         # Heuristically initialze to feasible latents.
-        logger.info("Heuristically initializing...")
         heuristic_options = {k.replace("heuristic_", ""): options.pop(k)
-                             for k in list(options) if k.startswith("heuristic_")}
-        init_values = self.heuristic(**heuristic_options)
-        assert isinstance(init_values, dict)
-        assert "auxiliary" in init_values, \
-            ".heuristic() did not define auxiliary value"
-        if self._dct is not None:
-            # Also initialize DCT transformed coordinates.
-            x = init_values["auxiliary"]
-            x = biject_to(constraints.interval(-0.5, self.population + 0.5)).inv(x)
-            x = DiscreteCosineTransform(smooth=self._dct)(x)
-            init_values["auxiliary_dct"] = x
+                             for k in list(options)
+                             if k.startswith("heuristic_")}
+
+        def heuristic():
+            with poutine.block():
+                init_values = self.heuristic(**heuristic_options)
+            assert isinstance(init_values, dict)
+            assert "auxiliary" in init_values, \
+                ".heuristic() did not define auxiliary value"
+            if self._dct is not None:
+                # Also initialize DCT transformed coordinates.
+                x = init_values["auxiliary"]
+                x = biject_to(constraints.interval(-0.5, self.population + 0.5)).inv(x)
+                x = DiscreteCosineTransform(smooth=self._dct)(x)
+                init_values["auxiliary_dct"] = x
+            logger.info("Heuristic init: {}".format(", ".join(
+                "{}={:0.3g}".format(k, v.item())
+                for k, v in init_values.items()
+                if v.numel() == 1)))
+            return init_to_value(values=init_values)
 
         # Configure a kernel.
         logger.info("Running inference...")
@@ -322,8 +345,10 @@ class CompartmentalModel(ABC):
             model = poutine.reparam(model, {"auxiliary": rep})
         kernel = NUTS(model,
                       full_mass=full_mass,
-                      init_strategy=init_to_value(values=init_values),
+                      init_strategy=init_to_generated(generate=heuristic),
                       max_tree_depth=max_tree_depth)
+        if options.pop("arrowhead_mass", False):
+            kernel.mass_matrix_adapter = ArrowheadMassMatrix()
 
         # Run mcmc.
         mcmc = MCMC(kernel, **options)

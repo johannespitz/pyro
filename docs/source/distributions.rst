@@ -64,6 +64,20 @@ BetaBinomial
     :undoc-members:
     :show-inheritance:
 
+CoalescentTimes
+---------------
+.. autoclass:: pyro.distributions.CoalescentTimes
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+CoalescentTimesWithRate
+-----------------------
+.. autoclass:: pyro.distributions.CoalescentTimesWithRate
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 ConditionalDistribution
 -----------------------
 .. autoclass:: pyro.distributions.ConditionalDistribution
@@ -274,13 +288,6 @@ Unit
     :undoc-members:
     :show-inheritance:
 
-VonMises
---------
-.. autoclass:: pyro.distributions.VonMises
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 VonMises3D
 ----------
 .. autoclass:: pyro.distributions.VonMises3D
@@ -350,13 +357,6 @@ LowerCholeskyAffine
 Permute
 -------
 .. autoclass:: pyro.distributions.transforms.Permute
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-TanhTransform
--------------
-.. autoclass:: pyro.distributions.transforms.TanhTransform
     :members:
     :undoc-members:
     :show-inheritance:
@@ -622,7 +622,3 @@ spline
 sylvester
 ---------
 .. autofunction:: pyro.distributions.transforms.sylvester
-
-tanh
-----
-.. autofunction:: pyro.distributions.transforms.tanh
